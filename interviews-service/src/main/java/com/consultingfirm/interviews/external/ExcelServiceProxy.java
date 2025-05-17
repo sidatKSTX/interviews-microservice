@@ -9,8 +9,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
-//@FeignClient(name = "common-excel-service", url = "${excel.processor.url}")
-@FeignClient(name = "common-excel-service")
+@FeignClient(name = "common-excel-service", url = "${excel.processor.url}")
 public interface ExcelServiceProxy {
     @PostMapping(value = "/api/process/interviews", consumes = {"multipart/form-data"})
     List<InterviewsEntity> processExcel(@RequestPart("file") MultipartFile file,
