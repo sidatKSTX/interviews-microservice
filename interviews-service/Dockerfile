@@ -11,7 +11,7 @@ RUN mvn clean package -DskipTests
 # Stage 2: Create a lightweight runtime image
 FROM openjdk:21-slim
 WORKDIR /interviews-service
-COPY --from=build /interviews-service/target/*.jarinterviews-service.jar
+COPY --from=build /interviews-service/target/*.jar interviews-service.jar
 
 # Use a minimal command to run the application
 ENTRYPOINT ["java", "-jar", "interviews-service.jar"]
