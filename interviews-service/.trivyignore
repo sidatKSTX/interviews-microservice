@@ -1,0 +1,6 @@
+# Trivy Ignore File
+# This file contains vulnerability IDs that should be ignored during security scans
+# Format: CVE-YYYY-NNNN or GHSA-XXXX-XXXX-XXXX
+
+# Example for Alpine SQLite vulnerability if needed:
+# CVE-2025-6965  # SQLite Integer Truncation - Alpine 3.21 limitation

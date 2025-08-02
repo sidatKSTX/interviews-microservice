@@ -31,6 +31,8 @@
 		<spring-boot-admin.version>3.4.1</spring-boot-admin.version>
 		<springdoc-openapi.version>2.7.0</springdoc-openapi.version>
 		<spring-cloud.version>2024.0.0</spring-cloud.version>
+		<sonar.organization>sidatkstx-1</sonar.organization>
+		<sonar.host.url>https://sonarcloud.io</sonar.host.url>
 	</properties>
 	<dependencies>
 		<dependency>

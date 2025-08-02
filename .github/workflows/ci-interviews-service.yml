@@ -1,0 +1,285 @@
+name: SonarQube
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: "21"
+  MAVEN_OPTS: "-Xmx1024m"
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: consultingfirm/interviews-service
+  IMAGE_TAG: ${{ github.sha }}
+  SERVICE_DIRECTORY: "interviews-service"
+  AWS_REGION: "us-east-1"
+
+jobs:
+  build:
+    name: Build and analyze
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'zulu'
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Build and analyze
+        working-directory: ./${{ env.SERVICE_DIRECTORY }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dsonar.projectKey=sidatKSTX_interviews-microservice
+
+  build-and-scan:
+    name: Build and Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    outputs:
+      image-uri: ${{ steps.build.outputs.image-uri }}
+      latest-uri: ${{ steps.build.outputs.latest-uri }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'corretto'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Build application
+        working-directory: ./${{ env.SERVICE_DIRECTORY }}
+        run: mvn -B clean package -DskipTests
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and tag Docker image
+        id: build
+        working-directory: ./${{ env.SERVICE_DIRECTORY }}
+        run: |
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          LATEST_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest"
+          
+          docker build -t "$IMAGE_URI" -t "$LATEST_URI" .
+          
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "latest-uri=$LATEST_URI" >> $GITHUB_OUTPUT
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.17.0
+        with:
+          scan-type: 'fs'
+          scan-ref: './${{ env.SERVICE_DIRECTORY }}'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+
+      - name: Upload Trivy filesystem scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+          category: 'trivy-filesystem'
+
+      - name: Run Trivy image scan
+        uses: aquasecurity/trivy-action@0.17.0
+        with:
+          scan-type: 'image'
+          image-ref: ${{ steps.build.outputs.image-uri }}
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+
+      - name: Upload Trivy image scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+          category: 'trivy-image'
+
+      - name: Run Trivy security gate
+        uses: aquasecurity/trivy-action@0.17.0
+        with:
+          scan-type: 'image'
+          image-ref: ${{ steps.build.outputs.image-uri }}
+          exit-code: '1'
+          severity: 'HIGH,CRITICAL'
+          trivyignores: '${{ env.SERVICE_DIRECTORY }}/.trivyignore'
+
+      - name: Push Docker images to ECR
+        run: |
+          docker push ${{ steps.build.outputs.image-uri }}
+          docker push ${{ steps.build.outputs.latest-uri }}
+
+      - name: Generate build summary
+        run: |
+          echo "## Build Summary 🏗️" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_DIRECTORY }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Java Version | ${{ env.JAVA_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image URI | ${{ steps.build.outputs.image-uri }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Latest URI | ${{ steps.build.outputs.latest-uri }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Git SHA | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+
+  container-security-audit:
+    name: Container Security Audit
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construct image URI and pull image
+        run: |
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          docker pull "$IMAGE_URI"
+
+      - name: Run comprehensive Trivy security scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ${{ github.workspace }}:/workspace \
+            -v ${{ github.workspace }}/${{ env.SERVICE_DIRECTORY }}/.trivyignore:/tmp/.trivyignore \
+            aquasec/trivy:latest image \
+            --ignorefile /tmp/.trivyignore \
+            --format json \
+            --output /workspace/trivy-comprehensive-results.json \
+            "${{ env.IMAGE_URI }}"
+
+      - name: Analyze security vulnerabilities
+        id: security-analysis
+        run: |
+          if [ -f trivy-comprehensive-results.json ]; then
+            CRITICAL_COUNT=$(jq '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | .VulnerabilityID' trivy-comprehensive-results.json | wc -l)
+            HIGH_COUNT=$(jq '.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH") | .VulnerabilityID' trivy-comprehensive-results.json | wc -l)
+            
+            echo "critical-count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+            echo "high-count=$HIGH_COUNT" >> $GITHUB_OUTPUT
+            
+            echo "Critical vulnerabilities: $CRITICAL_COUNT"
+            echo "High vulnerabilities: $HIGH_COUNT"
+            
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "❌ CRITICAL vulnerabilities found: $CRITICAL_COUNT"
+              exit 1
+            elif [ "$HIGH_COUNT" -gt 5 ]; then
+              echo "⚠️ WARNING: High number of HIGH vulnerabilities: $HIGH_COUNT (threshold: 5)"
+            else
+              echo "✅ Security audit passed"
+            fi
+          else
+            echo "❌ Trivy scan results not found"
+            exit 1
+          fi
+
+      - name: Generate security summary
+        if: always()
+        run: |
+          echo "## Security Audit Summary 🔒" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical | ${{ steps.security-analysis.outputs.critical-count || 'N/A' }} | ${{ steps.security-analysis.outputs.critical-count == '0' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| High | ${{ steps.security-analysis.outputs.high-count || 'N/A' }} | ${{ steps.security-analysis.outputs.high-count <= '5' && '✅' || '⚠️' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image URI | ${{ env.IMAGE_URI }} |" >> $GITHUB_STEP_SUMMARY
+
+  notify-completion:
+    name: Pipeline Completion Notification
+    runs-on: ubuntu-latest
+    needs: [build, build-and-scan, container-security-audit]
+    if: always()
+    
+    steps:
+      - name: Aggregate job results
+        id: aggregate
+        run: |
+          BUILD_ANALYZE_STATUS="${{ needs.build.result }}"
+          BUILD_SCAN_STATUS="${{ needs.build-and-scan.result }}"
+          SECURITY_STATUS="${{ needs.container-security-audit.result }}"
+          
+          echo "build-analyze-status=$BUILD_ANALYZE_STATUS" >> $GITHUB_OUTPUT
+          echo "build-scan-status=$BUILD_SCAN_STATUS" >> $GITHUB_OUTPUT
+          echo "security-status=$SECURITY_STATUS" >> $GITHUB_OUTPUT
+          
+          if [[ "$BUILD_ANALYZE_STATUS" == "success" && "$BUILD_SCAN_STATUS" == "success" && "$SECURITY_STATUS" == "success" ]]; then
+            echo "overall-status=success" >> $GITHUB_OUTPUT
+            echo "status-icon=✅" >> $GITHUB_OUTPUT
+          elif [[ "$BUILD_ANALYZE_STATUS" == "failure" || "$BUILD_SCAN_STATUS" == "failure" || "$SECURITY_STATUS" == "failure" ]]; then
+            echo "overall-status=failure" >> $GITHUB_OUTPUT
+            echo "status-icon=❌" >> $GITHUB_OUTPUT
+          else
+            echo "overall-status=partial" >> $GITHUB_OUTPUT
+            echo "status-icon=⚠️" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate final CI status summary
+        run: |
+          echo "## CI/CD Pipeline Summary ${{ steps.aggregate.outputs.status-icon }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Analysis | ${{ steps.aggregate.outputs.build-analyze-status == 'success' && '✅' || steps.aggregate.outputs.build-analyze-status == 'failure' && '❌' || '⚠️' }} | ${{ steps.aggregate.outputs.build-analyze-status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Scan | ${{ steps.aggregate.outputs.build-scan-status == 'success' && '✅' || steps.aggregate.outputs.build-scan-status == 'failure' && '❌' || '⚠️' }} | ${{ steps.aggregate.outputs.build-scan-status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Audit | ${{ steps.aggregate.outputs.security-status == 'success' && '✅' || steps.aggregate.outputs.security-status == 'failure' && '❌' || '⚠️' }} | ${{ steps.aggregate.outputs.security-status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pipeline Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service:** ${{ env.SERVICE_DIRECTORY }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Java Version:** ${{ env.JAVA_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Git SHA:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Overall Status:** ${{ steps.aggregate.outputs.overall-status }} ${{ steps.aggregate.outputs.status-icon }}" >> $GITHUB_STEP_SUMMARY
